@@ -9,12 +9,17 @@ const CONFIG = {
   payTo: "0xf7b0f21b141e3c2b0522b26d15ef047b22717202", // rune_lynx self-custody, Base
   network: "base",
   asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", // native USDC on Base
-  // ⚠ VERIFY AT DEPLOY: EIP-712 domain for Base-mainnet USDC ("USDC" vs "USD Coin")
-  // against coinbase/x402 packages' known-asset config; wrong name = unsignable.
-  assetExtra: { name: "USDC", version: "2" },
+  // VERIFIED 2026-07-26 against coinbase/x402 evm config: chain 8453 usdcName
+  // is "USD Coin" (testnets use "USDC" — do not copy their examples).
+  assetExtra: { name: "USD Coin", version: "2" },
   priceAtomic: "50000", // $0.05 (6 decimals)
-  // ⚠ VERIFY AT DEPLOY: keyless facilitator with base-mainnet settle support.
-  facilitator: "https://facilitator.x402.rs",
+  // ⚠ VERIFY AT DEPLOY: base-MAINNET facilitator. Probed 2026-07-26:
+  // facilitator.x402.rs + x402.org/facilitator = TESTNETS ONLY. Mainnet
+  // candidates: Circle gateway (gateway-api.circle.com, permissionless per
+  // their nanopayments docs; testnet twin gateway-api-testnet.circle.com) or
+  // Coinbase CDP facilitator (needs free CDP account). Probe /supported live
+  // before first deploy; config value below is the leading candidate.
+  facilitator: "https://gateway-api.circle.com",
   slaSeconds: 3600,
   serviceName: "rune_lynx root-cause code review",
 };
