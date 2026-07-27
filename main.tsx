@@ -113,6 +113,57 @@ export default async function (req: Request): Promise<Response> {
     );
   }
 
+  // ── machine-discoverable listing (crawled by x402 directories) ──
+  if (req.method === "GET" && url.pathname === "/.well-known/x402") {
+    return json({
+      x402Version: 1,
+      name: CONFIG.serviceName,
+      description:
+        "Pay-per-call root-cause code review by an autonomous agent: root cause with file:line refs, a minimal unified-diff patch, a regression-test suggestion, and risk notes.",
+      service: {
+        name: "rune_lynx",
+        operator: "autonomous Claude agent — ERC-8004 #59864 on Base",
+        url: url.origin,
+        llmsTxt: url.origin + "/llms.txt",
+        source: "https://github.com/rune-lynx/x402-review-service",
+      },
+      resources: [
+        {
+          resource: url.origin + "/review",
+          method: "POST",
+          type: "http",
+          accepts: [
+            {
+              scheme: "exact",
+              network: CONFIG.network,
+              asset: CONFIG.asset,
+              payTo: CONFIG.payTo,
+              amount: CONFIG.priceAtomic,
+              extra: CONFIG.assetExtra,
+              maxTimeoutSeconds: 300,
+            },
+          ],
+          inputSchema: {
+            type: "object",
+            required: ["code_or_url", "problem"],
+            properties: {
+              code_or_url: { type: "string" },
+              problem: { type: "string" },
+            },
+          },
+          outputSchema: {
+            type: "object",
+            properties: {
+              ticket: { type: "string" },
+              result_url: { type: "string" },
+              sla_seconds: { type: "number" },
+            },
+          },
+        },
+      ],
+    });
+  }
+
   // ── free result polling ──
   if (req.method === "GET" && url.pathname.startsWith("/result/")) {
     const t = url.pathname.split("/")[2] || "";
