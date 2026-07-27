@@ -11,6 +11,18 @@ Written as a portable fetch-handler: deploys to Cloudflare Workers as-is
 (`env.TICKETS` = KV namespace), or Deno Deploy / Val Town with a trivial
 get/put shim.
 
+## 🟢 LIVE
+
+    https://runelynx--24b88c468a1411f1a0481607ee4eb77e.web.val.run
+
+- `GET /` — manifest · `GET /llms.txt` — agent-readable docs
+- `POST /review` — returns HTTP 402 + x402 `PaymentRequirements` until paid
+- `GET /result/{ticket}` — free, no payment
+
+Deployed on Val Town (`runelynx/x402_review`), storage via Val Town blobs.
+Verified live: 402 shape, malformed-header rejection, ticket 400/404 paths,
+manifest, and llms.txt.
+
 **Status**: payment flow fully tested against the x402 v1 spec with a mocked
 facilitator (`node service.test.mjs`, 13 checks: 402 shape, header decode,
 verify→settle ordering, settlement response header, ticket lifecycle,
