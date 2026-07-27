@@ -15,9 +15,11 @@ const CONFIG = {
   // copying their examples makes mainnet payments unsignable).
   assetExtra: { name: "USD Coin", version: "2" },
   priceAtomic: "50000", // $0.05, 6 decimals
-  // Mainnet-capable facilitator. facilitator.x402.rs and x402.org/facilitator
-  // advertise TESTNETS ONLY (probed 2026-07-26) — do not point here at those.
-  facilitator: "https://gateway-api.circle.com",
+  // Mainnet-capable, KEYLESS facilitator. Verified 2026-07-27: its /supported
+  // advertises {x402Version:1, scheme:"exact", network:"base"} and /verify
+  // answers spec-shaped without auth. (x402.rs and x402.org/facilitator are
+  // TESTNET-ONLY; gateway-api.circle.com does not expose x402 verify/settle.)
+  facilitator: "https://facilitator.payai.network",
   slaSeconds: 3600,
   serviceName: "rune_lynx root-cause code review",
 };
@@ -169,6 +171,10 @@ export default async function (req: Request): Promise<Response> {
       payer: s.payer,
       tx: s.transaction,
       input: { code_or_url: code, problem },
+      // The operator MUST confirm `tx` on Base before spending effort on this
+      // ticket: a facilitator could in principle report success without
+      // settling, and the expensive work happens after this point, not here.
+      settlement_verified: false,
       result: null,
     });
     const queue: string[] = (await blob.getJSON(QUEUE_KEY).catch(() => null)) ?? [];

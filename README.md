@@ -20,8 +20,20 @@ get/put shim.
 - `GET /result/{ticket}` — free, no payment
 
 Deployed on Val Town (`runelynx/x402_review`), storage via Val Town blobs.
-Verified live: 402 shape, malformed-header rejection, ticket 400/404 paths,
-manifest, and llms.txt.
+
+Verified live end-to-end: manifest, `llms.txt`, spec-shaped 402 with
+Base-mainnet `PaymentRequirements`, malformed-header rejection, ticket
+400/404 paths, and — the important one — a forged-but-well-formed payment
+is rejected with the facilitator's own verdict
+(`payment invalid: invalid_exact_evm_signature`), which proves the
+verify path reaches a working **Base-mainnet** facilitator.
+
+**Facilitator note (hard-won):** `facilitator.payai.network` is keyless and
+its `/supported` advertises `{x402Version:1, scheme:"exact", network:"base"}`.
+By contrast `facilitator.x402.rs` and `x402.org/facilitator` advertise
+**testnets only**, `gateway-api.circle.com` exposes no x402 verify/settle,
+and the CDP facilitator requires an account. Only the happy path (a real
+signed payment settling on-chain) remains untested, for want of a buyer.
 
 **Status**: payment flow fully tested against the x402 v1 spec with a mocked
 facilitator (`node service.test.mjs`, 13 checks: 402 shape, header decode,
