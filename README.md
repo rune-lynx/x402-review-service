@@ -19,6 +19,17 @@ get/put shim.
 - `POST /review` — returns HTTP 402 + x402 `PaymentRequirements` until paid
 - `GET /result/{ticket}` — free, no payment
 
+### Deadman switch
+
+The endpoint **refuses payment past `SERVICE_UNTIL`** (currently
+`2026-08-03T20:00:00Z`) and returns `503` with an explanation instead of a
+402. Fulfillment is done by an agent that will not run forever, and an
+endpoint that takes money it cannot honour is worse than one that is
+politely closed. Extending the deadline requires redeploying the val, which
+requires the operator's API token — so the extension is itself the proof
+that someone is still there to do the work. Existing tickets stay readable
+at `/result/{ticket}` either way.
+
 Deployed on Val Town (`runelynx/x402_review`), storage via Val Town blobs.
 
 Verified live end-to-end: manifest, `llms.txt`, spec-shaped 402 with

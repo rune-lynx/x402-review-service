@@ -74,6 +74,23 @@ async function facilitatorCall(path: string, paymentPayload: unknown, reqs: unkn
 
 const TICKET_KEY = (t: string) => `x402_review:ticket:${t}`;
 const QUEUE_KEY = "x402_review:queue";
+const HEARTBEAT_KEY = "x402_review:operator_heartbeat"; // reserved (see note)
+
+// ── Deadman switch ───────────────────────────────────────────────────────────
+// Fulfillment is performed by an autonomous agent that will not run forever.
+// This endpoint must never take money it cannot honour, so it refuses payment
+// past a hard deadline and only ever charges while someone can actually
+// deliver. Extending the deadline requires redeploying this val, which
+// requires the operator's API token — so the extension IS the proof of life.
+// (A blob heartbeat was the first design; it does not work, because a val's
+// std/blob namespace is NOT the same store as the /v1/blob REST API — a val
+// cannot see blobs written from outside. Left documented rather than silently
+// dropped.)
+const SERVICE_UNTIL = "2026-08-03T20:00:00Z"; // last hour the operator can deliver
+
+function operatorIsLive(): { live: boolean; until: string } {
+  return { live: Date.now() < new Date(SERVICE_UNTIL).getTime(), until: SERVICE_UNTIL };
+}
 
 export default async function (req: Request): Promise<Response> {
   const url = new URL(req.url);
@@ -101,7 +118,14 @@ export default async function (req: Request): Promise<Response> {
         "GET /result/{ticket}": { price_usdc: "0", note: "free polling endpoint" },
       },
     };
-    if (url.pathname === "/") return json(manifest);
+    if (url.pathname === "/") {
+      const op = operatorIsLive();
+      return json({
+        ...manifest,
+        status: op.live ? "accepting payments" : "paused — operator offline, payments refused",
+        accepting_until: op.until,
+      });
+    }
     return new Response(
       `# ${manifest.name}\n\n` +
         `Agent-payable code review. ${manifest.endpoints["POST /review"].flow}\n` +
@@ -179,6 +203,24 @@ export default async function (req: Request): Promise<Response> {
 
   // ── the paid endpoint ──
   if (req.method === "POST" && url.pathname === "/review") {
+    // Refuse to charge before checking we can still deliver. This runs ahead of
+    // any facilitator call, so a dormant operator costs callers nothing.
+    const op = operatorIsLive();
+    if (!op.live) {
+      return json(
+        {
+          error: "service paused — not accepting payments",
+          reason:
+            "Fulfillment is performed by an autonomous agent that is not currently running, so this endpoint will not take payment it cannot honour.",
+          accepting_until: op.until,
+          existing_tickets: "still readable at /result/{ticket}",
+          source: "https://github.com/rune-lynx/x402-review-service",
+        },
+        503,
+        { "Retry-After": "3600" },
+      );
+    }
+
     const reqs = paymentRequirements(url.origin + "/review");
     const ph = req.headers.get("X-PAYMENT");
     if (!ph) {
