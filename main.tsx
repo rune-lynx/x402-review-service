@@ -9,7 +9,8 @@ import { blob } from "https://esm.town/v/std/blob/main.ts";
 
 const CONFIG = {
   payTo: "0xf7b0f21b141e3c2b0522b26d15ef047b22717202", // rune_lynx self-custody, Base
-  network: "base",
+  network: "base",                    // x402 v1 network id
+  networkCaip2: "eip155:8453",        // x402 v2 uses CAIP-2 (Base mainnet)
   asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", // native USDC on Base
   // chain 8453 USDC EIP-712 domain is "USD Coin" (testnets use "USDC" —
   // copying their examples makes mainnet payments unsignable).
@@ -50,12 +51,38 @@ function paymentRequirements(resourceUrl: string) {
     description:
       "Root-cause code review by an autonomous Claude agent: root cause with file:line refs, a minimal unified-diff patch, a regression-test suggestion, and risk notes. Async — the response is a ticket; the result appears at result_url within the SLA.",
     mimeType: "application/json",
+    // x402 discovery indexers (AgentCash / X402Scan) require outputSchema to
+    // carry BOTH an `input` and an `output` sub-schema — a plain JSON Schema
+    // here fails validation with SCHEMA_INPUT_MISSING / SCHEMA_OUTPUT_MISSING.
     outputSchema: {
-      type: "object",
-      properties: {
-        ticket: { type: "string" },
-        result_url: { type: "string" },
-        sla_seconds: { type: "number" },
+      input: {
+        type: "http",
+        method: "POST",
+        bodyType: "json",
+        bodyFields: {
+          type: "object",
+          required: ["code_or_url", "problem"],
+          properties: {
+            code_or_url: {
+              type: "string",
+              description: "Repo/PR/diff/gist URL, or inline code (≤48KB)",
+            },
+            problem: {
+              type: "string",
+              description: "Failing behaviour, error output, or review focus",
+            },
+          },
+        },
+      },
+      output: {
+        type: "object",
+        description:
+          "202 Accepted: a ticket plus a free polling URL. The finished review appears at result_url within sla_seconds.",
+        properties: {
+          ticket: { type: "string", description: "UUID identifying this review" },
+          result_url: { type: "string", description: "Free GET endpoint to poll" },
+          sla_seconds: { type: "number", description: "Delivery target in seconds" },
+        },
       },
     },
     maxTimeoutSeconds: 300,
@@ -63,11 +90,78 @@ function paymentRequirements(resourceUrl: string) {
   };
 }
 
-async function facilitatorCall(path: string, paymentPayload: unknown, reqs: unknown) {
+// x402 v2 restructures the challenge: `resource` is hoisted out of each accept,
+// `maxAmountRequired` becomes `amount`, networks are CAIP-2, and the whole thing
+// travels in a PAYMENT-REQUIRED header rather than the body.
+function paymentRequiredV2(resourceUrl: string) {
+  return {
+    x402Version: 2,
+    error: "PAYMENT-SIGNATURE header is required",
+    resource: {
+      url: resourceUrl,
+      description:
+        "Root-cause code review by an autonomous agent: root cause with file:line refs, a minimal unified-diff patch, a regression-test suggestion, and risk notes.",
+      mimeType: "application/json",
+    },
+    accepts: [
+      {
+        scheme: "exact",
+        network: CONFIG.networkCaip2,
+        amount: CONFIG.priceAtomic,
+        asset: CONFIG.asset,
+        payTo: CONFIG.payTo,
+        maxTimeoutSeconds: 300,
+        extra: CONFIG.assetExtra,
+      },
+    ],
+    // v2 carries the input/output schemas in the bazaar extension rather than
+    // in accepts[].outputSchema (which is where v1 puts them). Indexers read
+    // this path — omitting it fails validation with SCHEMA_*_MISSING.
+    extensions: {
+      bazaar: {
+        schema: {
+          properties: {
+            input: {
+              type: "object",
+              required: ["code_or_url", "problem"],
+              properties: {
+                code_or_url: {
+                  type: "string",
+                  description: "Repo/PR/diff/gist URL, or inline code (≤48KB)",
+                },
+                problem: {
+                  type: "string",
+                  description: "Failing behaviour, error output, or review focus",
+                },
+              },
+            },
+            output: {
+              type: "object",
+              description:
+                "202 Accepted: a ticket plus a free polling URL; the finished review appears at result_url within sla_seconds.",
+              properties: {
+                ticket: { type: "string" },
+                result_url: { type: "string" },
+                sla_seconds: { type: "number" },
+              },
+            },
+          },
+        },
+      },
+    },
+  };
+}
+
+async function facilitatorCall(
+  path: string,
+  paymentPayload: any,
+  reqs: unknown,
+  version: 1 | 2,
+) {
   const r = await fetch(CONFIG.facilitator + path, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ x402Version: 1, paymentPayload, paymentRequirements: reqs }),
+    body: JSON.stringify({ x402Version: version, paymentPayload, paymentRequirements: reqs }),
   });
   return r.json();
 }
@@ -135,6 +229,83 @@ export default async function (req: Request): Promise<Response> {
         `Source: ${manifest.source}\n`,
       { headers: { "content-type": "text/plain" } },
     );
+  }
+
+  // ── OpenAPI + x-payment-info: the discovery format x402/MPP indexers read ──
+  // Required by AgentCash's discovery spec and consumed by X402Scan/MppScan.
+  // Note their unit rule: x-payment-info.price.amount is DECIMAL USD here,
+  // while the runtime x402 `accepts[].amount` stays in token atomic units.
+  if (req.method === "GET" && url.pathname === "/openapi.json") {
+    return json({
+      openapi: "3.1.0",
+      info: {
+        title: CONFIG.serviceName,
+        version: "1.0.0",
+        description:
+          "Pay-per-call root-cause code review by an autonomous agent. Submit a repo/PR/diff URL or inline code plus the failing behaviour; receive the root cause with file:line references, a minimal unified-diff patch, a regression-test suggestion, and risk notes.",
+      contact: {
+        name: "rune_lynx",
+        url: "https://github.com/rune-lynx/x402-review-service",
+      },
+      "x-guidance":
+          "Call POST /review with JSON {code_or_url, problem}. Without an X-PAYMENT header you receive HTTP 402 carrying x402 PaymentRequirements (scheme 'exact', Base mainnet USDC). Pay, retry, and you get a ticket immediately; poll the free GET /result/{ticket} for the finished review within the stated SLA. No account, no API key. Payment stops being accepted after the service's published end date.",
+      },
+      servers: [{ url: url.origin }],
+      paths: {
+        "/review": {
+          post: {
+            summary: "Root-cause code review with a minimal patch",
+            operationId: "review",
+            requestBody: {
+              required: true,
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    required: ["code_or_url", "problem"],
+                    properties: {
+                      code_or_url: {
+                        type: "string",
+                        description: "Repo/PR/diff/gist URL, or inline code (≤48KB)",
+                      },
+                      problem: {
+                        type: "string",
+                        description: "Failing behaviour, error output, or review focus",
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            responses: {
+              "202": { description: "Accepted — returns {ticket, result_url, sla_seconds}" },
+              "402": { description: "Payment required — body carries x402 PaymentRequirements" },
+              "503": { description: "Service paused — operator offline, payment refused" },
+            },
+            "x-payment-info": {
+              price: { mode: "fixed", currency: "USD", amount: "0.050000" },
+              protocols: [{ x402: {} }],
+              network: CONFIG.network,
+              asset: CONFIG.asset,
+              payTo: CONFIG.payTo,
+            },
+          },
+        },
+        "/result/{ticket}": {
+          get: {
+            summary: "Fetch a completed review (free)",
+            operationId: "result",
+            parameters: [
+              { name: "ticket", in: "path", required: true, schema: { type: "string" } },
+            ],
+            responses: {
+              "200": { description: "status pending|done, with the review when done" },
+              "404": { description: "Unknown ticket" },
+            },
+          },
+        },
+      },
+    });
   }
 
   // ── machine-discoverable listing (crawled by x402 directories) ──
@@ -221,15 +392,30 @@ export default async function (req: Request): Promise<Response> {
       );
     }
 
-    const reqs = paymentRequirements(url.origin + "/review");
-    const ph = req.headers.get("X-PAYMENT");
-    if (!ph) {
-      return json({ x402Version: 1, error: "X-PAYMENT header is required", accepts: [reqs] }, 402);
-    }
-    const paymentPayload = b64decode(ph);
-    if (!paymentPayload || paymentPayload.x402Version !== 1) {
-      return json({ x402Version: 1, error: "malformed X-PAYMENT header", accepts: [reqs] }, 402);
-    }
+    const resourceUrl = url.origin + "/review";
+    const reqs = paymentRequirements(resourceUrl);      // v1 shape
+    const v2 = paymentRequiredV2(resourceUrl);          // v2 shape
+
+    // Accept EITHER protocol version. v2 clients send PAYMENT-SIGNATURE;
+    // v1 clients send X-PAYMENT. Strict in what we emit, liberal in what we
+    // accept — so one endpoint serves both networks of buyers.
+    const sigV2 = req.headers.get("PAYMENT-SIGNATURE");
+    const sigV1 = req.headers.get("X-PAYMENT");
+    const version: 1 | 2 = sigV2 ? 2 : 1;
+    const rawSig = sigV2 ?? sigV1;
+
+    // The 402 carries the v1 challenge in the body AND the v2 challenge in the
+    // PAYMENT-REQUIRED header, so neither generation of client needs to
+    // negotiate.
+    const challenge = (extra: Record<string, unknown> = {}) =>
+      json({ x402Version: 1, accepts: [reqs], ...extra }, 402, {
+        "PAYMENT-REQUIRED": b64encode(v2),
+      });
+
+    if (!rawSig) return challenge({ error: "X-PAYMENT or PAYMENT-SIGNATURE header is required" });
+
+    const paymentPayload = b64decode(rawSig);
+    if (!paymentPayload) return challenge({ error: "malformed payment header" });
 
     let body: any;
     try {
@@ -243,19 +429,17 @@ export default async function (req: Request): Promise<Response> {
       return json({ error: "code_or_url required, ≤48KB inline" }, 400);
     }
 
-    const v = await facilitatorCall("/verify", paymentPayload, reqs);
+    // v2 verification quotes the chosen `accepted` requirement back; v1 quotes
+    // the whole requirements object.
+    const reqsForFacilitator = version === 2 ? v2.accepts[0] : reqs;
+
+    const v = await facilitatorCall("/verify", paymentPayload, reqsForFacilitator, version);
     if (!v?.isValid) {
-      return json(
-        { x402Version: 1, error: "payment invalid: " + (v?.invalidReason ?? "unknown"), accepts: [reqs] },
-        402,
-      );
+      return challenge({ error: "payment invalid: " + (v?.invalidReason ?? "unknown") });
     }
-    const s = await facilitatorCall("/settle", paymentPayload, reqs);
+    const s = await facilitatorCall("/settle", paymentPayload, reqsForFacilitator, version);
     if (!s?.success) {
-      return json(
-        { x402Version: 1, error: "settlement failed: " + (s?.errorReason ?? "unknown"), accepts: [reqs] },
-        402,
-      );
+      return challenge({ error: "settlement failed: " + (s?.errorReason ?? "unknown") });
     }
 
     const ticket = crypto.randomUUID();
@@ -278,7 +462,7 @@ export default async function (req: Request): Promise<Response> {
       { ticket, result_url: url.origin + "/result/" + ticket, sla_seconds: CONFIG.slaSeconds },
       202,
       {
-        "X-PAYMENT-RESPONSE": b64encode({
+        [version === 2 ? "PAYMENT-RESPONSE" : "X-PAYMENT-RESPONSE"]: b64encode({
           success: true,
           transaction: s.transaction,
           network: s.network,
