@@ -33,12 +33,23 @@ const json = (obj: unknown, status = 200, headers: Record<string, string> = {}) 
 
 const b64decode = (s: string) => {
   try {
-    return JSON.parse(atob(s));
+    const bin = atob(s);
+    const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+    return JSON.parse(new TextDecoder().decode(bytes));
   } catch {
     return null;
   }
 };
-const b64encode = (o: unknown) => btoa(JSON.stringify(o));
+// btoa() only accepts Latin1. Our descriptions contain em dashes and ≤, which
+// throw InvalidCharacterError — so encode to UTF-8 bytes first. This matters
+// for the v2 PAYMENT-REQUIRED and PAYMENT-RESPONSE headers, which are base64
+// of JSON; the v1 body path never hit it because JSON isn't base64'd.
+const b64encode = (o: unknown) => {
+  const bytes = new TextEncoder().encode(JSON.stringify(o));
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+};
 
 function paymentRequirements(resourceUrl: string) {
   return {
@@ -119,6 +130,13 @@ function paymentRequiredV2(resourceUrl: string) {
     // this path — omitting it fails validation with SCHEMA_*_MISSING.
     extensions: {
       bazaar: {
+        // x402scan looks for `extensions.bazaar.info` + a schema-derived input;
+        // AgentCash reads `.schema`. Provide both rather than guess.
+        info: {
+          title: "Root-cause code review",
+          description:
+            "Submit a repo/PR/diff URL or inline code plus the failing behaviour; receive the root cause with file:line references, a minimal unified-diff patch, a regression-test suggestion, and risk notes.",
+        },
         schema: {
           properties: {
             input: {
@@ -251,6 +269,19 @@ export default async function (req: Request): Promise<Response> {
           "Call POST /review with JSON {code_or_url, problem}. Without an X-PAYMENT header you receive HTTP 402 carrying x402 PaymentRequirements (scheme 'exact', Base mainnet USDC). Pay, retry, and you get a ticket immediately; poll the free GET /result/{ticket} for the finished review within the stated SLA. No account, no API key. Payment stops being accepted after the service's published end date.",
       },
       servers: [{ url: url.origin }],
+      // Payment IS the auth: there are no API keys or accounts. Declared
+      // explicitly because indexers flag routes with no auth mode as ambiguous.
+      security: [],
+      components: {
+        securitySchemes: {
+          x402Payment: {
+            type: "http",
+            scheme: "x402",
+            description:
+              "Payment replaces authentication. Send X-PAYMENT (x402 v1) or PAYMENT-SIGNATURE (v2). No account or API key exists.",
+          },
+        },
+      },
       paths: {
         "/review": {
           post: {
@@ -278,7 +309,28 @@ export default async function (req: Request): Promise<Response> {
               },
             },
             responses: {
-              "202": { description: "Accepted — returns {ticket, result_url, sla_seconds}" },
+              "202": {
+                description: "Accepted — the review is queued",
+                content: {
+                  "application/json": {
+                    schema: {
+                      type: "object",
+                      required: ["ticket", "result_url", "sla_seconds"],
+                      properties: {
+                        ticket: { type: "string", description: "UUID identifying this review" },
+                        result_url: {
+                          type: "string",
+                          description: "Free GET endpoint to poll for the finished review",
+                        },
+                        sla_seconds: {
+                          type: "number",
+                          description: "Delivery target in seconds",
+                        },
+                      },
+                    },
+                  },
+                },
+              },
               "402": { description: "Payment required — body carries x402 PaymentRequirements" },
               "503": { description: "Service paused — operator offline, payment refused" },
             },
@@ -299,7 +351,25 @@ export default async function (req: Request): Promise<Response> {
               { name: "ticket", in: "path", required: true, schema: { type: "string" } },
             ],
             responses: {
-              "200": { description: "status pending|done, with the review when done" },
+              "200": {
+                description: "Ticket status; carries the review once complete",
+                content: {
+                  "application/json": {
+                    schema: {
+                      type: "object",
+                      properties: {
+                        status: { type: "string", enum: ["pending", "done"] },
+                        result: {
+                          type: "object",
+                          description:
+                            "Present when done: root cause, unified-diff patch, regression test, risk notes",
+                        },
+                        delivered_at: { type: "string" },
+                      },
+                    },
+                  },
+                },
+              },
               "404": { description: "Unknown ticket" },
             },
           },
@@ -311,6 +381,10 @@ export default async function (req: Request): Promise<Response> {
   // ── machine-discoverable listing (crawled by x402 directories) ──
   if (req.method === "GET" && url.pathname === "/.well-known/x402") {
     return json({
+      // x402scan compatibility fan-out: `version` + flat `resources` array.
+      // Extra descriptive fields below are additive and ignored by indexers.
+      version: 1,
+      resources: [url.origin + "/review"],
       x402Version: 1,
       name: CONFIG.serviceName,
       description:
@@ -322,7 +396,7 @@ export default async function (req: Request): Promise<Response> {
         llmsTxt: url.origin + "/llms.txt",
         source: "https://github.com/rune-lynx/x402-review-service",
       },
-      resources: [
+      resourceDetails: [
         {
           resource: url.origin + "/review",
           method: "POST",
@@ -373,7 +447,11 @@ export default async function (req: Request): Promise<Response> {
   }
 
   // ── the paid endpoint ──
-  if (req.method === "POST" && url.pathname === "/review") {
+  // Answer the paid route on GET as well as POST. Discovery probes issue a
+  // bare GET; if that falls through to 404 the resource is indexed as
+  // "no valid x402 response found" and never listed. Their spec is explicit:
+  // unauthenticated probes must reach the 402 challenge. Only POST does work.
+  if ((req.method === "POST" || req.method === "GET") && url.pathname === "/review") {
     // Refuse to charge before checking we can still deliver. This runs ahead of
     // any facilitator call, so a dormant operator costs callers nothing.
     const op = operatorIsLive();
@@ -412,7 +490,9 @@ export default async function (req: Request): Promise<Response> {
         "PAYMENT-REQUIRED": b64encode(v2),
       });
 
-    if (!rawSig) return challenge({ error: "X-PAYMENT or PAYMENT-SIGNATURE header is required" });
+    if (!rawSig || req.method === "GET") {
+      return challenge({ error: "X-PAYMENT or PAYMENT-SIGNATURE header is required" });
+    }
 
     const paymentPayload = b64decode(rawSig);
     if (!paymentPayload) return challenge({ error: "malformed payment header" });
